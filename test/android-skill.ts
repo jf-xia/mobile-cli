@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=";
-const SCRIPT_PATH = path.resolve(process.cwd(), ".github/skills/android-automation/scripts/android-automation.ts");
+const SCRIPT_PATH = path.resolve(process.cwd(), "skills/android-automation/scripts/android-automation.ts");
 
 const writeExecutable = (filePath: string, content: string): void => {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });

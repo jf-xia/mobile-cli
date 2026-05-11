@@ -20,8 +20,8 @@ user-invocable: true
 直接执行 skill 自带 TS 脚本：
 
 ```bash
-./.github/skills/android-automation/scripts/android-automation.ts doctor
-./.github/skills/android-automation/scripts/android-automation.ts devices:list
+./scripts/android-automation.ts doctor
+./scripts/android-automation.ts devices:list
 ```
 
 脚本启动时会先检查 `mobilecli`。如果未安装，会自动执行：
@@ -40,14 +40,14 @@ npm install -g mobilecli@latest
 ## 常用命令
 
 ```bash
-./.github/skills/android-automation/scripts/android-automation.ts doctor
-./.github/skills/android-automation/scripts/android-automation.ts devices:list
-./.github/skills/android-automation/scripts/android-automation.ts apps:list --device <device-id>
-./.github/skills/android-automation/scripts/android-automation.ts apps:install --device <device-id> --path ./app.apk
-./.github/skills/android-automation/scripts/android-automation.ts screen:elements --device <device-id>
-./.github/skills/android-automation/scripts/android-automation.ts screen:screenshot --device <device-id> --output ./tmp/screen.png
-./.github/skills/android-automation/scripts/android-automation.ts screen:record-start --device <device-id> --output ./tmp/demo.mp4
-./.github/skills/android-automation/scripts/android-automation.ts screen:record-stop --device <device-id>
+./scripts/android-automation.ts doctor
+./scripts/android-automation.ts devices:list
+./scripts/android-automation.ts apps:list --device <device-id>
+./scripts/android-automation.ts apps:install --device <device-id> --path ./app.apk
+./scripts/android-automation.ts screen:elements --device <device-id>
+./scripts/android-automation.ts screen:screenshot --device <device-id> --output ./tmp/screen.png
+./scripts/android-automation.ts screen:record-start --device <device-id> --output ./tmp/demo.mp4
+./scripts/android-automation.ts screen:record-stop --device <device-id>
 ```
 
 更多命令见 [命令参考](./references/command-reference.md)。限制说明见 [限制说明](./references/limitations.md)。

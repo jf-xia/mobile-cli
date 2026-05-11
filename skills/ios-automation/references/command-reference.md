@@ -3,7 +3,7 @@
 统一入口：
 
 ```bash
-./.github/skills/ios-automation/scripts/ios-automation.ts <command> [options]
+../scripts/ios-automation.ts <command> [options]
 ```
 
 ## 诊断与设备

@@ -20,8 +20,8 @@ user-invocable: true
 直接执行 skill 自带 TS 脚本：
 
 ```bash
-./.github/skills/ios-automation/scripts/ios-automation.ts doctor
-./.github/skills/ios-automation/scripts/ios-automation.ts devices:list
+./scripts/ios-automation.ts doctor
+./scripts/ios-automation.ts devices:list
 ```
 
 脚本启动时会先检查 `mobilecli`。如果未安装，会自动执行：
@@ -40,14 +40,14 @@ npm install -g mobilecli@latest
 ## 常用命令
 
 ```bash
-./.github/skills/ios-automation/scripts/ios-automation.ts doctor
-./.github/skills/ios-automation/scripts/ios-automation.ts devices:list
-./.github/skills/ios-automation/scripts/ios-automation.ts apps:list --device <device-id>
-./.github/skills/ios-automation/scripts/ios-automation.ts apps:install --device <device-id> --path ./MyApp.ipa
-./.github/skills/ios-automation/scripts/ios-automation.ts screen:size --device <device-id>
-./.github/skills/ios-automation/scripts/ios-automation.ts screen:screenshot --device <device-id> --output ./tmp/ios-screen.png
-./.github/skills/ios-automation/scripts/ios-automation.ts screen:record-start --device <device-id> --output ./tmp/ios.mp4
-./.github/skills/ios-automation/scripts/ios-automation.ts screen:record-stop --device <device-id>
+./scripts/ios-automation.ts doctor
+./scripts/ios-automation.ts devices:list
+./scripts/ios-automation.ts apps:list --device <device-id>
+./scripts/ios-automation.ts apps:install --device <device-id> --path ./MyApp.ipa
+./scripts/ios-automation.ts screen:size --device <device-id>
+./scripts/ios-automation.ts screen:screenshot --device <device-id> --output ./tmp/ios-screen.png
+./scripts/ios-automation.ts screen:record-start --device <device-id> --output ./tmp/ios.mp4
+./scripts/ios-automation.ts screen:record-stop --device <device-id>
 ```
 
 更多命令见 [命令参考](./references/command-reference.md)。限制说明见 [限制说明](./references/limitations.md)。

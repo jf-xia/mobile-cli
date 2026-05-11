@@ -8,7 +8,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=";
-const SCRIPT_PATH = path.resolve(process.cwd(), ".github/skills/ios-automation/scripts/ios-automation.ts");
+const SCRIPT_PATH = path.resolve(process.cwd(), "skills/ios-automation/scripts/ios-automation.ts");
 
 const readCommandLog = (filePath: string): string[] => {
 	if (!fs.existsSync(filePath)) {

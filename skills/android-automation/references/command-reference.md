@@ -3,7 +3,7 @@
 统一入口：
 
 ```bash
-./.github/skills/android-automation/scripts/android-automation.ts <command> [options]
+../scripts/android-automation.ts <command> [options]
 ```
 
 ## 诊断与设备
