@@ -30,6 +30,8 @@ user-invocable: true
 npm install -g mobilecli@latest
 ```
 
+真机自动化会优先使用本地 WebDriverAgent。默认从 `~/work/WebDriverAgent` 启动；如需自定义路径，可设置 `IOS_WDA_PATH`。WDA 启动等待时间可通过 `IOS_WDA_START_TIMEOUT` 调整，单位毫秒。
+
 ## 推荐流程
 
 1. 先运行 `doctor` 和 `devices:list`。

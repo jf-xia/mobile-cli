@@ -1,5 +1,8 @@
 import { Socket } from "node:net";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { WebDriverAgent } from "./webdriver-agent.ts";
 import { ActionableError, type Button, type InstalledApp, type Orientation, type Robot, type ScreenElement, type ScreenSize, type SwipeDirection } from "./robot.ts";
@@ -64,16 +67,50 @@ export class IosRobot implements Robot {
 
 	private async wda(): Promise<WebDriverAgent> {
 		await this.assertTunnelRunning();
+
 		if (!(await this.isWdaForwardRunning())) {
 			throw new ActionableError("Port forwarding to WebDriverAgent is not running");
 		}
 
 		const wda = new WebDriverAgent("localhost", getWdaPort());
-		if (!(await wda.isRunning())) {
-			throw new ActionableError("WebDriverAgent is not running on the device");
+		if (await wda.isRunning()) {
+			return wda;
 		}
 
-		return wda;
+		const wdaPath = process.env.IOS_WDA_PATH || path.join(os.homedir(), "work", "WebDriverAgent");
+		const projectFile = path.join(wdaPath, "WebDriverAgent.xcodeproj");
+
+		if (fs.existsSync(wdaPath) && fs.existsSync(projectFile)) {
+			try {
+				const timeoutMs = Number(process.env.IOS_WDA_START_TIMEOUT || "30000");
+				const args = [
+					"-project",
+					"WebDriverAgent.xcodeproj",
+					"-scheme",
+					"WebDriverAgentRunner",
+					"-destination",
+					`id=${this.deviceId}`,
+					"test",
+				];
+
+				const child = spawn("xcodebuild", args, { cwd: wdaPath, detached: true, stdio: "ignore", env: process.env });
+				if (child.pid) {
+					child.unref();
+				}
+
+				const deadline = Date.now() + timeoutMs;
+				while (Date.now() < deadline) {
+					if (await wda.isRunning()) {
+						return wda;
+					}
+					await new Promise(resolve => setTimeout(resolve, 1000));
+				}
+			} catch (err) {
+				// fallthrough to error below
+			}
+		}
+
+		throw new ActionableError("WebDriverAgent is not running on the device");
 	}
 
 	private async ios(...args: string[]): Promise<string> {
