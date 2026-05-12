@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -76,6 +77,37 @@ export class IosAutomationService {
 		const iosManager = new IosManager();
 		const simulators = !mobilecliVersion.startsWith("failed") ? this.mobilecli.getDevices({ platform: "ios", type: "simulator", includeOffline: false }).data.devices : [];
 
+		// Check tunnel and port forwarding status for real device automation
+		const isPortListening = (port: number): boolean => {
+			try {
+				execFileSync("lsof", ["-ti", String(port)], { stdio: ["pipe", "pipe", "ignore"] });
+				return true;
+			} catch {
+				return false;
+			}
+		};
+
+		const tunnelPort = Number(process.env.IOS_AUTOMATION_TUNNEL_PORT || 60105);
+		const wdaPort = Number(process.env.IOS_AUTOMATION_WDA_PORT || 8100);
+
+		const realDeviceCount = iosManager.listDevices().length;
+		const setupTips = [] as string[];
+
+		if (realDeviceCount > 0) {
+			const tunnelRunning = isPortListening(tunnelPort);
+			const wdaForwardRunning = isPortListening(wdaPort);
+
+			if (!tunnelRunning) {
+				setupTips.push(`Tunnel not running. Run: tunnel:start`);
+			}
+			if (tunnelRunning && !wdaForwardRunning) {
+				setupTips.push(`Port forwarding not running. Run: forward:start --device <device-id>`);
+			}
+			if (!wdaForwardRunning) {
+				setupTips.push(`WDA not available. For UI interaction run: setup --device <device-id> --wda`);
+			}
+		}
+
 		return {
 			nodeVersion: process.version,
 			platform: process.platform,
@@ -86,13 +118,14 @@ export class IosAutomationService {
 				},
 				goIos: {
 					available: iosManager.isGoIosInstalled(),
-					realDevices: iosManager.listDevices().length,
+					realDevices: realDeviceCount,
 				},
 				simulators: {
 					count: simulators.length,
 				},
 			},
 			stateFile: process.env.IOS_AUTOMATION_RECORDING_STATE_FILE || process.env.IOS_AUTOMATION_STATE_FILE || path.join(os.tmpdir(), "ios-automation-recordings.json"),
+			...(setupTips.length > 0 ? { setupTips } : {}),
 		};
 	}
 

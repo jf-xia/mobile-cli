@@ -2,6 +2,11 @@
 import { IosAutomationService } from "./ios-service.ts";
 import { ensureMobilecliInstalled } from "./mobilecli.ts";
 import { ActionableError, type Button, type Orientation, type SwipeDirection } from "./robot.ts";
+import { execFileSync, spawn } from "node:child_process";
+import { Socket } from "node:net";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 type ParsedOptions = Record<string, string | boolean>;
 
@@ -70,6 +75,150 @@ const readNumber = (options: ParsedOptions, key: string, required = true): numbe
 const readBoolean = (options: ParsedOptions, key: string): boolean => {
 	return options[key] === true;
 };
+
+// ========== Environment Setup Helpers ==========
+
+const getGoIosPath = (): string => process.env.GO_IOS_PATH || "ios";
+const getWdaPort = (): number => Number(process.env.IOS_AUTOMATION_WDA_PORT || 8100);
+const getTunnelPort = (): number => Number(process.env.IOS_AUTOMATION_TUNNEL_PORT || 60105);
+
+const isListeningOnPort = (port: number): Promise<boolean> => {
+	return new Promise(resolve => {
+		const client = new Socket();
+		client.connect(port, "localhost", () => {
+			client.destroy();
+			resolve(true);
+		});
+		client.on("error", () => {
+			resolve(false);
+		});
+	});
+};
+
+const checkTunnelRunning = (): Promise<boolean> => isListeningOnPort(getTunnelPort());
+const checkWdaForwardRunning = (): Promise<boolean> => isListeningOnPort(getWdaPort());
+
+const startTunnel = async (): Promise<{ success: boolean; message: string }> => {
+	if (await checkTunnelRunning()) {
+		return { success: true, message: "Tunnel already running" };
+	}
+
+	try {
+		// Kill any existing tunnel process on the port
+		try {
+			const pid = execFileSync("lsof", ["-ti", String(getTunnelPort())]).toString().trim();
+			if (pid) {
+				execFileSync("kill", ["-9", pid]);
+				await new Promise(resolve => setTimeout(resolve, 1000));
+			}
+		} catch {
+			// No process on port, good
+		}
+
+		const child = spawn(getGoIosPath(), ["tunnel", "start", "--userspace"], {
+			detached: true,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		let output = "";
+		child.stdout?.on("data", (data: Buffer) => { output += data.toString(); });
+		child.stderr?.on("data", (data: Buffer) => { output += data.toString(); });
+
+		child.unref();
+
+		// Wait for tunnel to start (max 10 seconds)
+		const deadline = Date.now() + 10000;
+		while (Date.now() < deadline) {
+			if (await checkTunnelRunning()) {
+				return { success: true, message: "Tunnel started successfully" };
+			}
+			await new Promise(resolve => setTimeout(resolve, 500));
+		}
+
+		return { success: false, message: `Tunnel failed to start: ${output}` };
+	} catch (error: any) {
+		return { success: false, message: `Tunnel start error: ${error.message}` };
+	}
+};
+
+const stopTunnel = (): { success: boolean; message: string } => {
+	try {
+		const pid = execFileSync("lsof", ["-ti", String(getTunnelPort())]).toString().trim();
+		if (pid) {
+			execFileSync("kill", ["-9", pid]);
+			return { success: true, message: "Tunnel stopped" };
+		}
+		return { success: true, message: "No tunnel running" };
+	} catch {
+		return { success: true, message: "No tunnel running" };
+	}
+};
+
+const startPortForward = (deviceId: string): { success: boolean; message: string } => {
+	try {
+		// Kill existing forward if any
+		try {
+			const pid = execFileSync("lsof", ["-ti", String(getWdaPort())]).toString().trim();
+			if (pid) {
+				execFileSync("kill", ["-9", pid]);
+			}
+		} catch {
+			// No process
+		}
+
+		const child = spawn(getGoIosPath(), ["--udid", deviceId, "forward", String(getWdaPort()), "8100"], {
+			detached: true,
+			stdio: ["ignore", "ignore", "ignore"],
+		});
+		child.unref();
+
+		return { success: true, message: `Port forwarding started: localhost:${getWdaPort()} -> device:8100` };
+	} catch (error: any) {
+		return { success: false, message: `Port forward error: ${error.message}` };
+	}
+};
+
+const startWda = (deviceId: string): { success: boolean; message: string } => {
+	const wdaPath = process.env.IOS_WDA_PATH || path.join(os.homedir(), "work", "WebDriverAgent");
+	const projectFile = path.join(wdaPath, "WebDriverAgent.xcodeproj");
+
+	if (!fs.existsSync(wdaPath) || !fs.existsSync(projectFile)) {
+		return { success: false, message: `WebDriverAgent project not found at ${wdaPath}. Please clone it first.` };
+	}
+
+	try {
+		const child = spawn("xcodebuild", [
+			"-project", "WebDriverAgent.xcodeproj",
+			"-scheme", "WebDriverAgentRunner",
+			"-destination", `id=${deviceId}`,
+			"test",
+		], {
+			cwd: wdaPath,
+			detached: true,
+			stdio: ["ignore", "ignore", "ignore"],
+			env: process.env,
+		});
+		child.unref();
+
+		return { success: true, message: "WDA build and install started (may take 30-60 seconds)" };
+	} catch (error: any) {
+		return { success: false, message: `WDA start error: ${error.message}` };
+	}
+};
+
+interface SetupStatus {
+	tunnel: { running: boolean; port: number };
+	portForward: { running: boolean; port: number };
+}
+
+const getSetupStatus = async (): Promise<SetupStatus> => {
+	return {
+		tunnel: { running: await checkTunnelRunning(), port: getTunnelPort() },
+		portForward: { running: await checkWdaForwardRunning(), port: getWdaPort() },
+	};
+};
+
+// ========== Main ==========
 
 const main = async (): Promise<void> => {
 	ensureMobilecliInstalled();
@@ -160,6 +309,81 @@ const main = async (): Promise<void> => {
 		case "crashes:get":
 			printSuccess(service.getCrash(readString(options, "device")!, readString(options, "id")!));
 			return;
+		// ========== New Environment Setup Commands ==========
+		case "setup": {
+			const setupDeviceId = readString(options, "device", false);
+			const setupStatus = await getSetupStatus();
+			const results: string[] = [];
+
+			if (!setupStatus.tunnel.running) {
+				results.push("Starting tunnel...");
+				const tunnelResult = await startTunnel();
+				results.push(tunnelResult.message);
+			} else {
+				results.push("Tunnel already running");
+			}
+
+			if (setupDeviceId) {
+				if (!setupStatus.portForward.running) {
+					results.push("Starting port forwarding...");
+					const forwardResult = startPortForward(setupDeviceId);
+					results.push(forwardResult.message);
+				} else {
+					results.push("Port forwarding already running");
+				}
+
+				if (readBoolean(options, "wda")) {
+					results.push("Starting WDA (this may take a while)...");
+					const wdaResult = startWda(setupDeviceId);
+					results.push(wdaResult.message);
+				}
+			}
+
+			const finalStatus = await getSetupStatus();
+			printSuccess({ message: results.join("\n"), status: finalStatus });
+			return;
+		}
+		case "tunnel:start": {
+			const tunnelResult = await startTunnel();
+			printSuccess(tunnelResult);
+			return;
+		}
+		case "tunnel:stop": {
+			const tunnelStopResult = stopTunnel();
+			printSuccess(tunnelStopResult);
+			return;
+		}
+		case "tunnel:status": {
+			const tunnelStatus = await getSetupStatus();
+			printSuccess(tunnelStatus);
+			return;
+		}
+		case "wda:start": {
+			const wdaDevice = readString(options, "device", true);
+			const wdaResult = startWda(wdaDevice);
+			printSuccess(wdaResult);
+			return;
+		}
+		case "forward:start": {
+			const fwdDevice = readString(options, "device", true);
+			const fwdResult = startPortForward(fwdDevice);
+			printSuccess(fwdResult);
+			return;
+		}
+		case "forward:stop": {
+			try {
+				const fwdPid = execFileSync("lsof", ["-ti", String(getWdaPort())]).toString().trim();
+				if (fwdPid) {
+					execFileSync("kill", ["-9", fwdPid]);
+					printSuccess({ success: true, message: "Port forwarding stopped" });
+				} else {
+					printSuccess({ success: true, message: "No port forwarding running" });
+				}
+			} catch {
+				printSuccess({ success: true, message: "No port forwarding running" });
+			}
+			return;
+		}
 		default:
 			throw new ActionableError(`Unknown command: ${command}`);
 	}
