@@ -69,7 +69,12 @@ export class IosAutomationService {
 			return new MobileDevice(deviceId);
 		}
 
-		throw new ActionableError(`iOS device "${deviceId}" not found`);
+		// Device not found - provide helpful error
+		const allDevices = this.listAvailableDevices();
+		const available = allDevices.devices.map(d => `  - ${d.name} (${d.id}) [${d.type}]`).join("\n");
+		throw new ActionableError(
+			`iOS device "${deviceId}" not found.\n\nAvailable devices:\n${available}\n\nRun 'devices:list' to see all devices.`
+		);
 	}
 
 	public doctor() {

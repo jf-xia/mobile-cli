@@ -22,18 +22,56 @@ export interface SourceTree {
 	value: SourceTreeElement;
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+
 export class WebDriverAgent {
 	private readonly host: string;
 	private readonly port: number;
+	private readonly timeoutMs: number;
 
-	public constructor(host: string, port: number) {
+	public constructor(host: string, port: number, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
 		this.host = host;
 		this.port = port;
+		this.timeoutMs = timeoutMs;
+	}
+
+	private async fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs?: number): Promise<Response> {
+		const timeout = timeoutMs ?? this.timeoutMs;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeout);
+		try {
+			const response = await fetch(url, { ...options, signal: controller.signal });
+			return response;
+		} catch (err: any) {
+			if (err.name === "AbortError") {
+				throw new ActionableError(`WDA request timed out after ${timeout}ms: ${url}`);
+			}
+			throw err;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	private async fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
+		let lastError: Error | undefined;
+		for (let i = 0; i <= retries; i++) {
+			try {
+				return await this.fetchWithTimeout(url, options);
+			} catch (err: any) {
+				lastError = err;
+				if (err.message?.includes("timed out") || i < retries) {
+					await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
+					continue;
+				}
+				throw err;
+			}
+		}
+		throw lastError!;
 	}
 
 	public async isRunning(): Promise<boolean> {
 		try {
-			const response = await fetch(`http://${this.host}:${this.port}/status`);
+			const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/status`, {}, 3000);
 			const json = await response.json() as any;
 			return response.status === 200 && json.value?.ready === true;
 		} catch {
@@ -42,7 +80,7 @@ export class WebDriverAgent {
 	}
 
 	public async createSession(): Promise<string> {
-		const response = await fetch(`http://${this.host}:${this.port}/session`, {
+		const response = await this.fetchWithRetry(`http://${this.host}:${this.port}/session`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ capabilities: { alwaysMatch: { platformName: "iOS" } } }),
@@ -61,7 +99,11 @@ export class WebDriverAgent {
 	}
 
 	public async deleteSession(sessionId: string): Promise<void> {
-		await fetch(`http://${this.host}:${this.port}/session/${sessionId}`, { method: "DELETE" });
+		try {
+			await this.fetchWithTimeout(`http://${this.host}:${this.port}/session/${sessionId}`, { method: "DELETE" });
+		} catch {
+			// Best effort - session will expire on the device anyway
+		}
 	}
 
 	public async withinSession<T>(fn: (sessionUrl: string) => Promise<T>): Promise<T> {
@@ -76,7 +118,7 @@ export class WebDriverAgent {
 
 	public async getScreenSize(sessionUrl?: string): Promise<ScreenSize> {
 		if (sessionUrl) {
-			const response = await fetch(`${sessionUrl}/wda/screen`);
+			const response = await this.fetchWithTimeout(`${sessionUrl}/wda/screen`);
 			const json = await response.json() as any;
 			return {
 				width: json.value.screenSize.width,
@@ -90,7 +132,7 @@ export class WebDriverAgent {
 
 	public async sendKeys(keys: string): Promise<void> {
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/wda/keys`, {
+			await this.fetchWithRetry(`${sessionUrl}/wda/keys`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ value: [keys] }),
@@ -111,11 +153,11 @@ export class WebDriverAgent {
 		}
 
 		if (!(button in supported)) {
-			throw new ActionableError(`Button "${button}" is not supported`);
+			throw new ActionableError(`Button "${button}" is not supported. Supported: ${Object.keys(supported).join(", ")}, ENTER`);
 		}
 
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/wda/pressButton`, {
+			await this.fetchWithRetry(`${sessionUrl}/wda/pressButton`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ name: button }),
@@ -129,7 +171,7 @@ export class WebDriverAgent {
 
 	public async doubleTap(x: number, y: number): Promise<void> {
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/actions`, {
+			await this.fetchWithTimeout(`${sessionUrl}/actions`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
@@ -159,7 +201,7 @@ export class WebDriverAgent {
 
 	private async pointerAction(x0: number, y0: number, x1: number, y1: number, duration: number): Promise<void> {
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/actions`, {
+			await this.fetchWithTimeout(`${sessionUrl}/actions`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
@@ -208,7 +250,7 @@ export class WebDriverAgent {
 	}
 
 	public async getPageSource(): Promise<SourceTree> {
-		const response = await fetch(`http://${this.host}:${this.port}/source/?format=json`);
+		const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/source/?format=json`, {}, 20000);
 		return await response.json() as SourceTree;
 	}
 
@@ -219,7 +261,7 @@ export class WebDriverAgent {
 
 	public async openUrl(url: string): Promise<void> {
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/url`, {
+			await this.fetchWithTimeout(`${sessionUrl}/url`, {
 				method: "POST",
 				body: JSON.stringify({ url }),
 			});
@@ -227,7 +269,7 @@ export class WebDriverAgent {
 	}
 
 	public async getScreenshot(): Promise<Buffer> {
-		const response = await fetch(`http://${this.host}:${this.port}/screenshot`);
+		const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/screenshot`, {}, 20000);
 		const json = await response.json() as any;
 		return Buffer.from(json.value, "base64");
 	}
@@ -265,7 +307,7 @@ export class WebDriverAgent {
 			}
 
 			await this.pointerAction(x0, y0, x1, y1, 1000);
-			await fetch(`${sessionUrl}/actions`, { method: "DELETE" });
+			await this.fetchWithTimeout(`${sessionUrl}/actions`, { method: "DELETE" });
 		});
 	}
 
@@ -292,7 +334,7 @@ export class WebDriverAgent {
 
 	public async setOrientation(orientation: Orientation): Promise<void> {
 		await this.withinSession(async sessionUrl => {
-			await fetch(`${sessionUrl}/orientation`, {
+			await this.fetchWithTimeout(`${sessionUrl}/orientation`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ orientation: orientation.toUpperCase() }),
@@ -302,7 +344,7 @@ export class WebDriverAgent {
 
 	public async getOrientation(): Promise<Orientation> {
 		return this.withinSession(async sessionUrl => {
-			const response = await fetch(`${sessionUrl}/orientation`);
+			const response = await this.fetchWithTimeout(`${sessionUrl}/orientation`);
 			const json = await response.json() as any;
 			return String(json.value).toLowerCase() === "landscape" ? "landscape" : "portrait";
 		});

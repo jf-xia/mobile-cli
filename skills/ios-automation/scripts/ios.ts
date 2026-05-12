@@ -1,15 +1,15 @@
-import { Socket } from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { getGoIosPath, getWdaPort, getTunnelPort, getWdaStartTimeout, isListeningOnPort } from "./config.ts";
+import { StatusCache } from "./status-cache.ts";
 import { WebDriverAgent } from "./webdriver-agent.ts";
 import { ActionableError, type Button, type InstalledApp, type Orientation, type Robot, type ScreenElement, type ScreenSize, type SwipeDirection } from "./robot.ts";
 import { validateLocale, validatePackageName } from "./utils.ts";
 
-const getWdaPort = (): number => Number(process.env.IOS_AUTOMATION_WDA_PORT || 8100);
-const getTunnelPort = (): number => Number(process.env.IOS_AUTOMATION_TUNNEL_PORT || 60105);
+const statusCache = new StatusCache(5000);
 
 interface ListCommandOutput {
 	deviceList: string[];
@@ -29,8 +29,6 @@ export interface IosDevice {
 	deviceName: string;
 }
 
-const getGoIosPath = (): string => process.env.GO_IOS_PATH || "ios";
-
 export class IosRobot implements Robot {
 	private readonly deviceId: string;
 
@@ -38,25 +36,12 @@ export class IosRobot implements Robot {
 		this.deviceId = deviceId;
 	}
 
-	private isListeningOnPort(port: number): Promise<boolean> {
-		return new Promise(resolve => {
-			const client = new Socket();
-			client.connect(port, "localhost", () => {
-				client.destroy();
-				resolve(true);
-			});
-			client.on("error", () => {
-				resolve(false);
-			});
-		});
-	}
-
 	private async isTunnelRunning(): Promise<boolean> {
-		return this.isListeningOnPort(getTunnelPort());
+		return statusCache.check("tunnel", () => isListeningOnPort(getTunnelPort()));
 	}
 
 	private async isWdaForwardRunning(): Promise<boolean> {
-		return this.isListeningOnPort(getWdaPort());
+		return statusCache.check("wda-forward", () => isListeningOnPort(getWdaPort()));
 	}
 
 	private async assertTunnelRunning(): Promise<void> {
@@ -69,7 +54,10 @@ export class IosRobot implements Robot {
 		await this.assertTunnelRunning();
 
 		if (!(await this.isWdaForwardRunning())) {
-			throw new ActionableError("Port forwarding to WebDriverAgent is not running");
+			throw new ActionableError(
+				"Port forwarding to WebDriverAgent is not running.\n" +
+				"Run: ./scripts/ios-automation.ts forward:start --device " + this.deviceId
+			);
 		}
 
 		const wda = new WebDriverAgent("localhost", getWdaPort());
@@ -82,7 +70,7 @@ export class IosRobot implements Robot {
 
 		if (fs.existsSync(wdaPath) && fs.existsSync(projectFile)) {
 			try {
-				const timeoutMs = Number(process.env.IOS_WDA_START_TIMEOUT || "30000");
+				const timeoutMs = getWdaStartTimeout();
 				const args = [
 					"-project",
 					"WebDriverAgent.xcodeproj",
@@ -101,16 +89,24 @@ export class IosRobot implements Robot {
 				const deadline = Date.now() + timeoutMs;
 				while (Date.now() < deadline) {
 					if (await wda.isRunning()) {
+						statusCache.invalidate("wda-running");
 						return wda;
 					}
 					await new Promise(resolve => setTimeout(resolve, 1000));
 				}
 			} catch (err) {
 				// fallthrough to error below
-			}
+				}
 		}
 
-		throw new ActionableError("WebDriverAgent is not running on the device");
+		throw new ActionableError(
+			"WebDriverAgent is not running on the device.\n" +
+			"Possible solutions:\n" +
+			"1. Run: ./scripts/ios-automation.ts setup --device " + this.deviceId + " --wda\n" +
+			"2. Check Xcode is installed: xcodebuild -version\n" +
+			"3. Check device is trusted for development\n" +
+			"4. Try: cd ~/work/WebDriverAgent && xcodebuild test ..."
+		);
 	}
 
 	private async ios(...args: string[]): Promise<string> {

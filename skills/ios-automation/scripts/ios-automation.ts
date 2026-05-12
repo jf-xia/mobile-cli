@@ -2,11 +2,14 @@
 import { IosAutomationService } from "./ios-service.ts";
 import { ensureMobilecliInstalled } from "./mobilecli.ts";
 import { ActionableError, type Button, type Orientation, type SwipeDirection } from "./robot.ts";
+import { getGoIosPath, getWdaPort, getTunnelPort, isListeningOnPort } from "./config.ts";
+import { StatusCache } from "./status-cache.ts";
 import { execFileSync, spawn } from "node:child_process";
-import { Socket } from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+const statusCache = new StatusCache(3000);
 
 type ParsedOptions = Record<string, string | boolean>;
 
@@ -76,27 +79,8 @@ const readBoolean = (options: ParsedOptions, key: string): boolean => {
 	return options[key] === true;
 };
 
-// ========== Environment Setup Helpers ==========
-
-const getGoIosPath = (): string => process.env.GO_IOS_PATH || "ios";
-const getWdaPort = (): number => Number(process.env.IOS_AUTOMATION_WDA_PORT || 8100);
-const getTunnelPort = (): number => Number(process.env.IOS_AUTOMATION_TUNNEL_PORT || 60105);
-
-const isListeningOnPort = (port: number): Promise<boolean> => {
-	return new Promise(resolve => {
-		const client = new Socket();
-		client.connect(port, "localhost", () => {
-			client.destroy();
-			resolve(true);
-		});
-		client.on("error", () => {
-			resolve(false);
-		});
-	});
-};
-
-const checkTunnelRunning = (): Promise<boolean> => isListeningOnPort(getTunnelPort());
-const checkWdaForwardRunning = (): Promise<boolean> => isListeningOnPort(getWdaPort());
+const checkTunnelRunning = (): Promise<boolean> => statusCache.check("tunnel", () => isListeningOnPort(getTunnelPort()));
+const checkWdaForwardRunning = (): Promise<boolean> => statusCache.check("wda-forward", () => isListeningOnPort(getWdaPort()));
 
 const startTunnel = async (): Promise<{ success: boolean; message: string }> => {
 	if (await checkTunnelRunning()) {
@@ -154,13 +138,14 @@ const stopTunnel = (): { success: boolean; message: string } => {
 	}
 };
 
-const startPortForward = (deviceId: string): { success: boolean; message: string } => {
+const startPortForward = async (deviceId: string): Promise<{ success: boolean; message: string }> => {
 	try {
 		// Kill existing forward if any
 		try {
 			const pid = execFileSync("lsof", ["-ti", String(getWdaPort())]).toString().trim();
 			if (pid) {
 				execFileSync("kill", ["-9", pid]);
+				await new Promise(resolve => setTimeout(resolve, 500));
 			}
 		} catch {
 			// No process
@@ -172,18 +157,35 @@ const startPortForward = (deviceId: string): { success: boolean; message: string
 		});
 		child.unref();
 
-		return { success: true, message: `Port forwarding started: localhost:${getWdaPort()} -> device:8100` };
+		// Verify port forwarding actually started
+		statusCache.invalidate("wda-forward");
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline) {
+			if (await isListeningOnPort(getWdaPort())) {
+				return { success: true, message: `Port forwarding verified: localhost:${getWdaPort()} -> device:8100` };
+			}
+			await new Promise(resolve => setTimeout(resolve, 200));
+		}
+
+		return { success: false, message: "Port forwarding process started but port is not listening after 5 seconds" };
 	} catch (error: any) {
 		return { success: false, message: `Port forward error: ${error.message}` };
 	}
 };
 
-const startWda = (deviceId: string): { success: boolean; message: string } => {
+const startWda = async (deviceId: string): Promise<{ success: boolean; message: string }> => {
 	const wdaPath = process.env.IOS_WDA_PATH || path.join(os.homedir(), "work", "WebDriverAgent");
 	const projectFile = path.join(wdaPath, "WebDriverAgent.xcodeproj");
 
 	if (!fs.existsSync(wdaPath) || !fs.existsSync(projectFile)) {
 		return { success: false, message: `WebDriverAgent project not found at ${wdaPath}. Please clone it first.` };
+	}
+
+	// Check if WDA is already running
+	const { WebDriverAgent } = await import("./webdriver-agent.ts");
+	const wda = new WebDriverAgent("localhost", getWdaPort());
+	if (await wda.isRunning()) {
+		return { success: true, message: "WDA is already running" };
 	}
 
 	try {
@@ -200,7 +202,24 @@ const startWda = (deviceId: string): { success: boolean; message: string } => {
 		});
 		child.unref();
 
-		return { success: true, message: "WDA build and install started (may take 30-60 seconds)" };
+		// Wait for WDA to be ready
+		const timeoutMs = Number(process.env.IOS_WDA_START_TIMEOUT || "60000");
+		const startTime = Date.now();
+		while (Date.now() - startTime < timeoutMs) {
+			try {
+				if (await wda.isRunning()) {
+					const elapsed = Math.round((Date.now() - startTime) / 1000);
+					return { success: true, message: `WDA started and ready (${elapsed}s)` };
+				}
+			} catch {
+				// Ignore connection errors during startup
+			}
+			const elapsed = Math.round((Date.now() - startTime) / 1000);
+			process.stderr.write(`\rWaiting for WDA... ${elapsed}s`);
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+
+		return { success: false, message: `WDA startup timed out after ${Math.round(timeoutMs / 1000)}s. Check device trust and Xcode setup.` };
 	} catch (error: any) {
 		return { success: false, message: `WDA start error: ${error.message}` };
 	}
@@ -216,6 +235,32 @@ const getSetupStatus = async (): Promise<SetupStatus> => {
 		tunnel: { running: await checkTunnelRunning(), port: getTunnelPort() },
 		portForward: { running: await checkWdaForwardRunning(), port: getWdaPort() },
 	};
+};
+
+// ========== Device Validation ==========
+
+const requireDeviceId = (options: ParsedOptions): string => {
+	const deviceId = readString(options, "device");
+	if (!deviceId) {
+		throw new ActionableError("Missing required option --device. Run 'devices:list' to see available devices.");
+	}
+	return deviceId;
+};
+
+const validateDeviceExists = (service: IosAutomationService, deviceId: string): void => {
+	const devices = service.listAvailableDevices();
+	if (!devices.devices.some(d => d.id === deviceId)) {
+		const available = devices.devices.map(d => `  - ${d.name} (${d.id})`).join("\n");
+		throw new ActionableError(
+			`Device "${deviceId}" not found.\n\nAvailable devices:\n${available}\n\nRun 'devices:list' to see all devices.`
+		);
+	}
+};
+
+const requireDevice = (options: ParsedOptions, service: IosAutomationService): string => {
+	const deviceId = requireDeviceId(options);
+	validateDeviceExists(service, deviceId);
+	return deviceId;
 };
 
 // ========== Main ==========
@@ -246,69 +291,140 @@ const main = async (): Promise<void> => {
 		case "remote:release":
 			printSuccess(service.releaseRemoteDevice(readString(options, "device")!));
 			return;
-		case "apps:list":
-			printSuccess(await service.listApps(readString(options, "device")!));
+		case "apps:list": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.listApps(deviceId));
 			return;
-		case "apps:launch":
-			printSuccess(await service.launchApp(readString(options, "device")!, readString(options, "package")!, readString(options, "locale", false)));
+		}
+		case "apps:launch": {
+			const deviceId = requireDevice(options, service);
+			const pkg = readString(options, "package");
+			if (!pkg) throw new ActionableError("Missing required option --package");
+			printSuccess(await service.launchApp(deviceId, pkg, readString(options, "locale", false)));
 			return;
-		case "apps:terminate":
-			printSuccess(await service.terminateApp(readString(options, "device")!, readString(options, "package")!));
+		}
+		case "apps:terminate": {
+			const deviceId = requireDevice(options, service);
+			const pkg = readString(options, "package");
+			if (!pkg) throw new ActionableError("Missing required option --package");
+			printSuccess(await service.terminateApp(deviceId, pkg));
 			return;
-		case "apps:install":
-			printSuccess(await service.installApp(readString(options, "device")!, readString(options, "path")!));
+		}
+		case "apps:install": {
+			const deviceId = requireDevice(options, service);
+			const installPath = readString(options, "path");
+			if (!installPath) throw new ActionableError("Missing required option --path");
+			printSuccess(await service.installApp(deviceId, installPath));
 			return;
-		case "apps:uninstall":
-			printSuccess(await service.uninstallApp(readString(options, "device")!, readString(options, "bundle-id")!));
+		}
+		case "apps:uninstall": {
+			const deviceId = requireDevice(options, service);
+			const bundleId = readString(options, "bundle-id");
+			if (!bundleId) throw new ActionableError("Missing required option --bundle-id");
+			printSuccess(await service.uninstallApp(deviceId, bundleId));
 			return;
-		case "screen:size":
-			printSuccess(await service.getScreenSize(readString(options, "device")!));
+		}
+		case "screen:size": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.getScreenSize(deviceId));
 			return;
-		case "screen:tap":
-			printSuccess(await service.tap(readString(options, "device")!, readNumber(options, "x")!, readNumber(options, "y")!));
+		}
+		case "screen:tap": {
+			const deviceId = requireDevice(options, service);
+			const x = readNumber(options, "x");
+			const y = readNumber(options, "y");
+			if (x === undefined || y === undefined) throw new ActionableError("Missing required options --x and --y");
+			printSuccess(await service.tap(deviceId, x, y));
 			return;
-		case "screen:double-tap":
-			printSuccess(await service.doubleTap(readString(options, "device")!, readNumber(options, "x")!, readNumber(options, "y")!));
+		}
+		case "screen:double-tap": {
+			const deviceId = requireDevice(options, service);
+			const x = readNumber(options, "x");
+			const y = readNumber(options, "y");
+			if (x === undefined || y === undefined) throw new ActionableError("Missing required options --x and --y");
+			printSuccess(await service.doubleTap(deviceId, x, y));
 			return;
-		case "screen:long-press":
-			printSuccess(await service.longPress(readString(options, "device")!, readNumber(options, "x")!, readNumber(options, "y")!, readNumber(options, "duration", false) || 500));
+		}
+		case "screen:long-press": {
+			const deviceId = requireDevice(options, service);
+			const x = readNumber(options, "x");
+			const y = readNumber(options, "y");
+			if (x === undefined || y === undefined) throw new ActionableError("Missing required options --x and --y");
+			printSuccess(await service.longPress(deviceId, x, y, readNumber(options, "duration", false) || 500));
 			return;
-		case "screen:elements":
-			printSuccess(await service.listElements(readString(options, "device")!));
+		}
+		case "screen:elements": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.listElements(deviceId));
 			return;
-		case "screen:button":
-			printSuccess(await service.pressButton(readString(options, "device")!, readString(options, "button")! as Button));
+		}
+		case "screen:button": {
+			const deviceId = requireDevice(options, service);
+			const button = readString(options, "button");
+			if (!button) throw new ActionableError("Missing required option --button. Supported: HOME, VOLUME_UP, VOLUME_DOWN, ENTER");
+			printSuccess(await service.pressButton(deviceId, button as Button));
 			return;
-		case "screen:open-url":
-			printSuccess(await service.openUrl(readString(options, "device")!, readString(options, "url")!));
+		}
+		case "screen:open-url": {
+			const deviceId = requireDevice(options, service);
+			const url = readString(options, "url");
+			if (!url) throw new ActionableError("Missing required option --url");
+			printSuccess(await service.openUrl(deviceId, url));
 			return;
-		case "screen:swipe":
-			printSuccess(await service.swipe(readString(options, "device")!, readString(options, "direction")! as SwipeDirection, readNumber(options, "x", false), readNumber(options, "y", false), readNumber(options, "distance", false)));
+		}
+		case "screen:swipe": {
+			const deviceId = requireDevice(options, service);
+			const direction = readString(options, "direction");
+			if (!direction) throw new ActionableError("Missing required option --direction. Supported: up, down, left, right");
+			printSuccess(await service.swipe(deviceId, direction as SwipeDirection, readNumber(options, "x", false), readNumber(options, "y", false), readNumber(options, "distance", false)));
 			return;
-		case "screen:type":
-			printSuccess(await service.typeKeys(readString(options, "device")!, readString(options, "text")!, readBoolean(options, "submit")));
+		}
+		case "screen:type": {
+			const deviceId = requireDevice(options, service);
+			const text = readString(options, "text");
+			if (text === undefined) throw new ActionableError("Missing required option --text");
+			printSuccess(await service.typeKeys(deviceId, text, readBoolean(options, "submit")));
 			return;
-		case "screen:screenshot":
-			printSuccess(await service.saveScreenshot(readString(options, "device")!, readString(options, "output", false)));
+		}
+		case "screen:screenshot": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.saveScreenshot(deviceId, readString(options, "output", false)));
 			return;
-		case "screen:record-start":
-			printSuccess(await service.startScreenRecording(readString(options, "device")!, readString(options, "output", false), readNumber(options, "time-limit", false)));
+		}
+		case "screen:record-start": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.startScreenRecording(deviceId, readString(options, "output", false), readNumber(options, "time-limit", false)));
 			return;
-		case "screen:record-stop":
-			printSuccess(await service.stopScreenRecording(readString(options, "device")!));
+		}
+		case "screen:record-stop": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.stopScreenRecording(deviceId));
 			return;
-		case "orientation:get":
-			printSuccess(await service.getOrientation(readString(options, "device")!));
+		}
+		case "orientation:get": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(await service.getOrientation(deviceId));
 			return;
-		case "orientation:set":
-			printSuccess(await service.setOrientation(readString(options, "device")!, readString(options, "orientation")! as Orientation));
+		}
+		case "orientation:set": {
+			const deviceId = requireDevice(options, service);
+			const orientation = readString(options, "orientation");
+			if (!orientation) throw new ActionableError("Missing required option --orientation. Supported: portrait, landscape");
+			printSuccess(await service.setOrientation(deviceId, orientation as Orientation));
 			return;
-		case "crashes:list":
-			printSuccess(service.listCrashes(readString(options, "device")!));
+		}
+		case "crashes:list": {
+			const deviceId = requireDevice(options, service);
+			printSuccess(service.listCrashes(deviceId));
 			return;
-		case "crashes:get":
-			printSuccess(service.getCrash(readString(options, "device")!, readString(options, "id")!));
+		}
+		case "crashes:get": {
+			const deviceId = requireDevice(options, service);
+			const crashId = readString(options, "id");
+			if (!crashId) throw new ActionableError("Missing required option --id");
+			printSuccess(service.getCrash(deviceId, crashId));
 			return;
+		}
 		// ========== New Environment Setup Commands ==========
 		case "setup": {
 			const setupDeviceId = readString(options, "device", false);
@@ -326,7 +442,7 @@ const main = async (): Promise<void> => {
 			if (setupDeviceId) {
 				if (!setupStatus.portForward.running) {
 					results.push("Starting port forwarding...");
-					const forwardResult = startPortForward(setupDeviceId);
+					const forwardResult = await startPortForward(setupDeviceId);
 					results.push(forwardResult.message);
 				} else {
 					results.push("Port forwarding already running");
@@ -334,11 +450,12 @@ const main = async (): Promise<void> => {
 
 				if (readBoolean(options, "wda")) {
 					results.push("Starting WDA (this may take a while)...");
-					const wdaResult = startWda(setupDeviceId);
+					const wdaResult = await startWda(setupDeviceId);
 					results.push(wdaResult.message);
 				}
 			}
 
+			statusCache.invalidate();
 			const finalStatus = await getSetupStatus();
 			printSuccess({ message: results.join("\n"), status: finalStatus });
 			return;
@@ -360,13 +477,13 @@ const main = async (): Promise<void> => {
 		}
 		case "wda:start": {
 			const wdaDevice = readString(options, "device", true);
-			const wdaResult = startWda(wdaDevice);
+			const wdaResult = await startWda(wdaDevice);
 			printSuccess(wdaResult);
 			return;
 		}
 		case "forward:start": {
 			const fwdDevice = readString(options, "device", true);
-			const fwdResult = startPortForward(fwdDevice);
+			const fwdResult = await startPortForward(fwdDevice);
 			printSuccess(fwdResult);
 			return;
 		}
