@@ -1,10 +1,10 @@
 ---
 name: android-automation
-description: "在 VS Code 中执行 Android 真机与模拟器自动化。用于设备巡检、应用安装启动、界面元素读取、点击输入、截图、录屏、崩溃查看与 Android 远程设备申请。"
+description: "android"
 argument-hint: "描述 Android 自动化任务，例如：列出设备、安装 APK、截图、查看界面元素、开始录屏"
 user-invocable: true
 ---
-
+desc: 在 VS Code 中执行 Android 真机与模拟器自动化。用于设备巡检、应用安装启动、界面元素读取、点击输入、截图、录屏、崩溃查看与 Android 远程设备申请。
 # Android 自动化技能
 
 ## 适用场景
