@@ -8,6 +8,7 @@ import { MobileDevice } from "./mobile-device.ts";
 import { Mobilecli, type MobilecliDevicesResponse } from "./mobilecli.ts";
 import { PNG } from "./png.ts";
 import { RecordingStateStore, isProcessRunning, type RecordingStateEntry } from "./recording-state.ts";
+import { logTiming } from "./timing-logger.ts";
 import { ActionableError, type Button, type Orientation, type Robot, type ScreenElement, type ScreenSize, type SwipeDirection } from "./robot.ts";
 import { validateFileExtension, validateOutputPath } from "./utils.ts";
 
@@ -51,9 +52,12 @@ export class IosAutomationService {
 	}
 
 	private getRobotFromDevice(deviceId: string): Robot {
+		const _t0 = performance.now();
 		const iosManager = new IosManager();
-		if (iosManager.listDevices().some(device => device.deviceId === deviceId)) {
-			return new IosRobot(deviceId);
+		const realDevice = iosManager.listDevicesWithDetails().find(d => d.deviceId === deviceId);
+		if (realDevice) {
+			logTiming("ios-service.ts", "getRobotFromDevice", performance.now() - _t0, "ok", `real:${deviceId.slice(0,8)}`);
+			return new IosRobot(deviceId, realDevice.version);
 		}
 
 		const simulator = this.getSimulatorDevices().data.devices.find(device => device.id === deviceId);
@@ -66,12 +70,14 @@ export class IosAutomationService {
 				this.verifiedSimulators.add(deviceId);
 			}
 
+			logTiming("ios-service.ts", "getRobotFromDevice", performance.now() - _t0, "ok", `simulator:${deviceId.slice(0,8)}`);
 			return new MobileDevice(deviceId);
 		}
 
 		// Device not found - provide helpful error
 		const allDevices = this.listAvailableDevices();
 		const available = allDevices.devices.map(d => `  - ${d.name} (${d.id}) [${d.type}]`).join("\n");
+		logTiming("ios-service.ts", "getRobotFromDevice", performance.now() - _t0, "error", `not found: ${deviceId.slice(0,8)}`);
 		throw new ActionableError(
 			`iOS device "${deviceId}" not found.\n\nAvailable devices:\n${available}\n\nRun 'devices:list' to see all devices.`
 		);

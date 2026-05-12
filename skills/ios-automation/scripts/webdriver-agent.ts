@@ -1,4 +1,5 @@
 import { ActionableError, type Orientation, type ScreenElement, type ScreenSize, type SwipeDirection } from "./robot.ts";
+import { logTiming } from "./timing-logger.ts";
 
 export interface SourceTreeElementRect {
 	x: number;
@@ -39,13 +40,19 @@ export class WebDriverAgent {
 		const timeout = timeoutMs ?? this.timeoutMs;
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeout);
+		const urlPath = new URL(url).pathname;
+		const start = performance.now();
 		try {
 			const response = await fetch(url, { ...options, signal: controller.signal });
+			logTiming("webdriver-agent.ts", `fetch:${urlPath}`, performance.now() - start, "ok", `status=${response.status}`);
 			return response;
 		} catch (err: any) {
+			const duration = performance.now() - start;
 			if (err.name === "AbortError") {
+				logTiming("webdriver-agent.ts", `fetch:${urlPath}`, duration, "error", `timeout=${timeout}ms`);
 				throw new ActionableError(`WDA request timed out after ${timeout}ms: ${url}`);
 			}
+			logTiming("webdriver-agent.ts", `fetch:${urlPath}`, duration, "error", err.message?.slice(0, 100));
 			throw err;
 		} finally {
 			clearTimeout(timer);
@@ -70,16 +77,21 @@ export class WebDriverAgent {
 	}
 
 	public async isRunning(): Promise<boolean> {
+		const _t0 = performance.now();
 		try {
 			const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/status`, {}, 3000);
 			const json = await response.json() as any;
-			return response.status === 200 && json.value?.ready === true;
+			const ready = response.status === 200 && json.value?.ready === true;
+			logTiming("webdriver-agent.ts", "isRunning", performance.now() - _t0, "ok", `ready=${ready}`);
+			return ready;
 		} catch {
+			logTiming("webdriver-agent.ts", "isRunning", performance.now() - _t0, "ok", "ready=false");
 			return false;
 		}
 	}
 
 	public async createSession(): Promise<string> {
+		const _t0 = performance.now();
 		const response = await this.fetchWithRetry(`http://${this.host}:${this.port}/session`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -87,14 +99,17 @@ export class WebDriverAgent {
 		});
 
 		if (!response.ok) {
+			logTiming("webdriver-agent.ts", "createSession", performance.now() - _t0, "error", `status=${response.status}`);
 			throw new ActionableError(`Failed to create WebDriver session: ${response.status} ${await response.text()}`);
 		}
 
 		const json = await response.json() as any;
 		if (!json.value?.sessionId) {
+			logTiming("webdriver-agent.ts", "createSession", performance.now() - _t0, "error", "no sessionId");
 			throw new ActionableError(`Invalid session response: ${JSON.stringify(json)}`);
 		}
 
+		logTiming("webdriver-agent.ts", "createSession", performance.now() - _t0);
 		return json.value.sessionId;
 	}
 
@@ -107,10 +122,16 @@ export class WebDriverAgent {
 	}
 
 	public async withinSession<T>(fn: (sessionUrl: string) => Promise<T>): Promise<T> {
+		const _t0 = performance.now();
 		const sessionId = await this.createSession();
 		const sessionUrl = `http://${this.host}:${this.port}/session/${sessionId}`;
 		try {
-			return await fn(sessionUrl);
+			const result = await fn(sessionUrl);
+			logTiming("webdriver-agent.ts", "withinSession", performance.now() - _t0);
+			return result;
+		} catch (err: any) {
+			logTiming("webdriver-agent.ts", "withinSession", performance.now() - _t0, "error", err.message?.slice(0, 100));
+			throw err;
 		} finally {
 			await this.deleteSession(sessionId);
 		}
@@ -250,13 +271,19 @@ export class WebDriverAgent {
 	}
 
 	public async getPageSource(): Promise<SourceTree> {
+		const _t0 = performance.now();
 		const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/source/?format=json`, {}, 20000);
-		return await response.json() as SourceTree;
+		const result = await response.json() as SourceTree;
+		logTiming("webdriver-agent.ts", "getPageSource", performance.now() - _t0);
+		return result;
 	}
 
 	public async getElementsOnScreen(): Promise<ScreenElement[]> {
+		const _t0 = performance.now();
 		const source = await this.getPageSource();
-		return this.filterSourceElements(source.value);
+		const elements = this.filterSourceElements(source.value);
+		logTiming("webdriver-agent.ts", "getElementsOnScreen", performance.now() - _t0, "ok", `${elements.length} elements`);
+		return elements;
 	}
 
 	public async openUrl(url: string): Promise<void> {
@@ -269,9 +296,12 @@ export class WebDriverAgent {
 	}
 
 	public async getScreenshot(): Promise<Buffer> {
+		const _t0 = performance.now();
 		const response = await this.fetchWithTimeout(`http://${this.host}:${this.port}/screenshot`, {}, 20000);
 		const json = await response.json() as any;
-		return Buffer.from(json.value, "base64");
+		const buf = Buffer.from(json.value, "base64");
+		logTiming("webdriver-agent.ts", "getScreenshot", performance.now() - _t0, "ok", `${buf.length} bytes`);
+		return buf;
 	}
 
 	public async swipe(direction: SwipeDirection): Promise<void> {

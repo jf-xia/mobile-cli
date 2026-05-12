@@ -2,8 +2,9 @@
 import { IosAutomationService } from "./ios-service.ts";
 import { ensureMobilecliInstalled } from "./mobilecli.ts";
 import { ActionableError, type Button, type Orientation, type SwipeDirection } from "./robot.ts";
-import { getGoIosPath, getWdaPort, getTunnelPort, isListeningOnPort } from "./config.ts";
+import { getGoIosPath, getWdaPort, getTunnelPort, getWdaDerivedDataPath, isListeningOnPort } from "./config.ts";
 import { StatusCache } from "./status-cache.ts";
+import { logTiming } from "./timing-logger.ts";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -83,7 +84,9 @@ const checkTunnelRunning = (): Promise<boolean> => statusCache.check("tunnel", (
 const checkWdaForwardRunning = (): Promise<boolean> => statusCache.check("wda-forward", () => isListeningOnPort(getWdaPort()));
 
 const startTunnel = async (): Promise<{ success: boolean; message: string }> => {
+	const _t0 = performance.now();
 	if (await checkTunnelRunning()) {
+		logTiming("ios-automation.ts", "startTunnel", performance.now() - _t0, "ok", "already running");
 		return { success: true, message: "Tunnel already running" };
 	}
 
@@ -114,13 +117,16 @@ const startTunnel = async (): Promise<{ success: boolean; message: string }> => 
 		const deadline = Date.now() + 10000;
 		while (Date.now() < deadline) {
 			if (await checkTunnelRunning()) {
+				logTiming("ios-automation.ts", "startTunnel", performance.now() - _t0);
 				return { success: true, message: "Tunnel started successfully" };
 			}
 			await new Promise(resolve => setTimeout(resolve, 500));
 		}
 
+		logTiming("ios-automation.ts", "startTunnel", performance.now() - _t0, "error", "timeout");
 		return { success: false, message: `Tunnel failed to start: ${output}` };
 	} catch (error: any) {
+		logTiming("ios-automation.ts", "startTunnel", performance.now() - _t0, "error", error.message);
 		return { success: false, message: `Tunnel start error: ${error.message}` };
 	}
 };
@@ -139,6 +145,7 @@ const stopTunnel = (): { success: boolean; message: string } => {
 };
 
 const startPortForward = async (deviceId: string): Promise<{ success: boolean; message: string }> => {
+	const _t0 = performance.now();
 	try {
 		// Kill existing forward if any
 		try {
@@ -162,22 +169,27 @@ const startPortForward = async (deviceId: string): Promise<{ success: boolean; m
 		const deadline = Date.now() + 5000;
 		while (Date.now() < deadline) {
 			if (await isListeningOnPort(getWdaPort())) {
-				return { success: true, message: `Port forwarding verified: localhost:${getWdaPort()} -> device:8100` };
+				logTiming("ios-automation.ts", "startPortForward", performance.now() - _t0);
+			return { success: true, message: `Port forwarding verified: localhost:${getWdaPort()} -> device:8100` };
 			}
 			await new Promise(resolve => setTimeout(resolve, 200));
 		}
 
+		logTiming("ios-automation.ts", "startPortForward", performance.now() - _t0, "error", "timeout");
 		return { success: false, message: "Port forwarding process started but port is not listening after 5 seconds" };
 	} catch (error: any) {
+		logTiming("ios-automation.ts", "startPortForward", performance.now() - _t0, "error", error.message);
 		return { success: false, message: `Port forward error: ${error.message}` };
 	}
 };
 
 const startWda = async (deviceId: string): Promise<{ success: boolean; message: string }> => {
+	const _t0 = performance.now();
 	const wdaPath = process.env.IOS_WDA_PATH || path.join(os.homedir(), "work", "WebDriverAgent");
 	const projectFile = path.join(wdaPath, "WebDriverAgent.xcodeproj");
 
 	if (!fs.existsSync(wdaPath) || !fs.existsSync(projectFile)) {
+		logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "error", "project not found");
 		return { success: false, message: `WebDriverAgent project not found at ${wdaPath}. Please clone it first.` };
 	}
 
@@ -185,20 +197,38 @@ const startWda = async (deviceId: string): Promise<{ success: boolean; message: 
 	const { WebDriverAgent } = await import("./webdriver-agent.ts");
 	const wda = new WebDriverAgent("localhost", getWdaPort());
 	if (await wda.isRunning()) {
+		logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "ok", "already running");
 		return { success: true, message: "WDA is already running" };
 	}
+
+	// Check if build products exist for test-without-building optimization
+	const derivedDataPath = getWdaDerivedDataPath();
+	const buildProductPath = path.join(derivedDataPath, "Build", "Products", "Debug-iphoneos", "WebDriverAgentRunner-Runner.app");
+	const isBuilt = fs.existsSync(buildProductPath);
+	const buildCmd = isBuilt ? "test-without-building" : "test";
+
+	logTiming("ios-automation.ts", "startWda", 0, "ok", `starting ${buildCmd} (built=${isBuilt})`);
 
 	try {
 		const child = spawn("xcodebuild", [
 			"-project", "WebDriverAgent.xcodeproj",
 			"-scheme", "WebDriverAgentRunner",
 			"-destination", `id=${deviceId}`,
-			"test",
+			"-derivedDataPath", derivedDataPath,
+			buildCmd,
 		], {
 			cwd: wdaPath,
 			detached: true,
-			stdio: ["ignore", "ignore", "ignore"],
+			stdio: ["ignore", "ignore", "pipe"],
 			env: process.env,
+		});
+		let xcodebuildExited = false;
+		let xcodebuildExitCode: number | null = null;
+		let xcodebuildError = "";
+		child.stderr?.on("data", (data: Buffer) => { xcodebuildError += data.toString().slice(-500); });
+		child.on("exit", (code) => {
+			xcodebuildExited = true;
+			xcodebuildExitCode = code;
 		});
 		child.unref();
 
@@ -206,9 +236,15 @@ const startWda = async (deviceId: string): Promise<{ success: boolean; message: 
 		const timeoutMs = Number(process.env.IOS_WDA_START_TIMEOUT || "60000");
 		const startTime = Date.now();
 		while (Date.now() - startTime < timeoutMs) {
+			if (xcodebuildExited) {
+				const errorMsg = xcodebuildError.includes("not trusted") ? "Developer certificate not trusted. Go to Settings > General > VPN & Device Management and trust the certificate." : xcodebuildError.slice(-200);
+				logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "error", `xcodebuild exited code ${xcodebuildExitCode}`);
+				return { success: false, message: `WDA build failed (exit code ${xcodebuildExitCode}). ${errorMsg}` };
+			}
 			try {
 				if (await wda.isRunning()) {
 					const elapsed = Math.round((Date.now() - startTime) / 1000);
+					logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "ok", `${buildCmd} ready in ${elapsed}s`);
 					return { success: true, message: `WDA started and ready (${elapsed}s)` };
 				}
 			} catch {
@@ -219,8 +255,10 @@ const startWda = async (deviceId: string): Promise<{ success: boolean; message: 
 			await new Promise(resolve => setTimeout(resolve, 1000));
 		}
 
+		logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "error", "timeout");
 		return { success: false, message: `WDA startup timed out after ${Math.round(timeoutMs / 1000)}s. Check device trust and Xcode setup.` };
 	} catch (error: any) {
+		logTiming("ios-automation.ts", "startWda", performance.now() - _t0, "error", error.message);
 		return { success: false, message: `WDA start error: ${error.message}` };
 	}
 };
@@ -479,6 +517,38 @@ const main = async (): Promise<void> => {
 			const wdaDevice = readString(options, "device", true);
 			const wdaResult = await startWda(wdaDevice);
 			printSuccess(wdaResult);
+			return;
+		}
+		case "wda:build": {
+			const _t0 = performance.now();
+			const wdaPath = process.env.IOS_WDA_PATH || path.join(os.homedir(), "work", "WebDriverAgent");
+			const projectFile = path.join(wdaPath, "WebDriverAgent.xcodeproj");
+			if (!fs.existsSync(wdaPath) || !fs.existsSync(projectFile)) {
+				throw new ActionableError(`WebDriverAgent project not found at ${wdaPath}`);
+			}
+			const derivedDataPath = getWdaDerivedDataPath();
+			const wdaDevice = readString(options, "device", true);
+			process.stderr.write("Building WDA (this may take a minute)...\n");
+			execFileSync("xcodebuild", [
+				"-project", "WebDriverAgent.xcodeproj",
+				"-scheme", "WebDriverAgentRunner",
+				"-destination", `id=${wdaDevice}`,
+				"-derivedDataPath", derivedDataPath,
+				"build-for-testing",
+			], { cwd: wdaPath, stdio: "inherit", env: process.env });
+			const elapsed = Math.round((performance.now() - _t0) / 1000);
+			logTiming("ios-automation.ts", "wda:build", performance.now() - _t0);
+			printSuccess({ success: true, message: `WDA built in ${elapsed}s. Now use 'wda:start' to launch it quickly.` });
+			return;
+		}
+		case "wda:clean": {
+			const derivedDataPath = getWdaDerivedDataPath();
+			if (fs.existsSync(derivedDataPath)) {
+				fs.rmSync(derivedDataPath, { recursive: true, force: true });
+				printSuccess({ success: true, message: `Cleaned WDA build at ${derivedDataPath}` });
+			} else {
+				printSuccess({ success: true, message: "No build to clean" });
+			}
 			return;
 		}
 		case "forward:start": {

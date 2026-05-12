@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { logTiming } from "./timing-logger.ts";
 
 export interface MobilecliCrashEntry {
 	processName: string;
@@ -119,15 +120,21 @@ export class Mobilecli {
 	}
 
 	public executeCommand(args: string[]): string {
-		return execFileSync(this.getPath(), args, { encoding: "utf8" }).toString().trim();
+		const _t0 = performance.now();
+		const output = execFileSync(this.getPath(), args, { encoding: "utf8" }).toString().trim();
+		logTiming("mobilecli.ts", `mobilecli:${args[0]}`, performance.now() - _t0);
+		return output;
 	}
 
 	public executeCommandBuffer(args: string[]): Buffer {
-		return execFileSync(this.getPath(), args, {
+		const _t0 = performance.now();
+		const buf = execFileSync(this.getPath(), args, {
 			encoding: "buffer",
 			timeout: TIMEOUT,
 			maxBuffer: MAX_BUFFER_SIZE,
 		}) as Buffer;
+		logTiming("mobilecli.ts", `mobilecli:${args[0]}:buf`, performance.now() - _t0);
+		return buf;
 	}
 
 	public spawnCommand(args: string[], options?: { detached?: boolean; stdio?: StdioOptions }): ChildProcess {
